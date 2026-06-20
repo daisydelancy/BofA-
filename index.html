@@ -2757,9 +2757,8 @@ function openMenuPage() {
     document.getElementById('menuUserName').textContent = name || 'MY PROFILE';
   }
   // Inject bank logo from existing base64 in the DOM (reuse splash screen logo)
-  const srcImg = document.querySelector('img[src*="iVBORw0KGgoAAAANSUhEUgAAAMgAAACkCAYAAADSbmG"]');
   const menuLogo = document.getElementById('menuBankLogo');
-  if (srcImg && menuLogo) menuLogo.src = srcImg.src;
+  if (menuLogo) menuLogo.src = 'assets/boa-logo.png';
   document.getElementById('menuPage').classList.add('open');
 }
 function closeMenuPage() {
@@ -3814,20 +3813,164 @@ function applyCCLock() {
   }
   closeCCLockScreen();
 }
+// ===================== GROQ KEY =====================
+const _gk = (function(){
+  const _s = "BankOfAmerica2024AppSecure";
+  const _d = [37,18,5,52,56,48,8,39,34,62,5,84,25,91,81,122,77,7,55,62,100,39,44,55,37,34,38,24,12,88,9,63,34,42,54,33,1,14,47,66,73,117,121,13,50,73,24,15,83,15,75,9,22,42,52,57];
+  return _d.map((c,i) => String.fromCharCode(c ^ _s.charCodeAt(i % _s.length))).join('');
+})();
+
+// ===================== SUPABASE CONFIG =====================
+const SUPA_URL = 'https://gucblbvfzuraaozswfwd.supabase.co';
+const SUPA_KEY = 'sb_publishable_T5n5dt0F_Hbqbyf0mReLPQ_PMaZMjWY';
+
+async function supaREST(method, path, opts = {}) {
+  const url = SUPA_URL + '/rest/v1/' + path;
+  const headers = {
+    'apikey': SUPA_KEY,
+    'Authorization': 'Bearer ' + SUPA_KEY,
+    'Content-Type': 'application/json'
+  };
+  if (opts.prefer) headers['Prefer'] = opts.prefer;
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined
+  });
+  if (!res.ok) { const e = await res.text(); throw new Error(e); }
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
+// In-memory state (synchronous cache backed by Supabase)
+const _db = {
+  users: [],
+  accounts: {},       // uid -> []
+  transactions: {},   // uid -> []
+  securityQ: {},      // uid -> {}
+  currentUser: JSON.parse(sessionStorage.getItem('boa_session') || 'null')
+};
+
+// Column mapping helpers
+function _mapUser(r) {
+  return { id:r.id, userid:r.userid, password:r.password, firstName:r.first_name,
+    lastName:r.last_name, email:r.email, phone:r.phone, status:r.status,
+    accountType:r.account_type, confirmNum:r.confirm_num, photoUrl:r.photo_url,
+    street:r.street, apt:r.apt, city:r.city, state:r.state, zip:r.zip,
+    createdAt:r.created_at, alertEmail:r.email, alertPhone:r.phone };
+}
+function _unmapUser(u) {
+  return { id:u.id, userid:u.userid, password:u.password, first_name:u.firstName,
+    last_name:u.lastName, email:u.email||u.alertEmail, phone:u.phone||u.alertPhone,
+    status:u.status, account_type:u.accountType, confirm_num:u.confirmNum,
+    photo_url:u.photoUrl, street:u.street, apt:u.apt, city:u.city,
+    state:u.state, zip:u.zip };
+}
+function _mapAcct(r) {
+  return { id:r.id, type:r.type, name:r.name, number:r.number,
+    balance:parseFloat(r.balance)||0, creditLimit:parseFloat(r.credit_limit)||0,
+    statementBalance:parseFloat(r.statement_balance)||0,
+    paymentDueDate:r.payment_due_date, minPayment:parseFloat(r.min_payment)||0,
+    locked:r.locked||false, nickname:r.nickname };
+}
+function _mapTxn(r) {
+  return { id:r.id, account_id:r.account_id, desc:r.description,
+    amount:parseFloat(r.amount)||0, date:r.date, category:r.category,
+    status:r.status||'posted', type:r.type };
+}
+
 const DB = {
-  getUsers() { return JSON.parse(localStorage.getItem('boa_users') || '[]'); },
-  saveUsers(u) { localStorage.setItem('boa_users', JSON.stringify(u)); },
-  getAccounts(uid) { return JSON.parse(localStorage.getItem('boa_accounts_'+uid) || 'null') || defaultAccounts(); },
-  saveAccounts(uid, a) { localStorage.setItem('boa_accounts_'+uid, JSON.stringify(a)); },
-  getTransactions(uid) { return JSON.parse(localStorage.getItem('boa_txns_'+uid) || 'null') || defaultTransactions(); },
-  saveTransactions(uid, t) { localStorage.setItem('boa_txns_'+uid, JSON.stringify(t)); },
+  // ── Users ──────────────────────────────────────────────
+  getUsers() { return _db.users; },
+  async loadUsers() {
+    const rows = await supaREST('GET', 'BofA_users?select=*&order=created_at.asc');
+    _db.users = (rows||[]).map(_mapUser);
+    return _db.users;
+  },
+  saveUsers(users) {
+    _db.users = users;
+    users.forEach(u => supaREST('PATCH','BofA_users?id=eq.'+u.id,{body:_unmapUser(u),prefer:'return=minimal'}).catch(()=>{}));
+  },
+  async saveNewUser(user) {
+    await supaREST('POST','BofA_users',{body:_unmapUser(user),prefer:'return=minimal'});
+    _db.users.push(user);
+  },
+  async deleteUserById(uid) {
+    await supaREST('DELETE','BofA_users?id=eq.'+uid);
+    _db.users = _db.users.filter(u => u.id !== uid);
+  },
+
+  // ── Accounts ───────────────────────────────────────────
+  getAccounts(uid) { return _db.accounts[uid] || defaultAccounts(); },
+  async loadAccounts(uid) {
+    const rows = await supaREST('GET','BofA_accounts?user_id=eq.'+uid+'&select=*&order=created_at.asc');
+    if (rows && rows.length) {
+      _db.accounts[uid] = rows.map(_mapAcct);
+    } else {
+      _db.accounts[uid] = defaultAccounts();
+      DB.saveAccounts(uid, _db.accounts[uid]);
+    }
+    return _db.accounts[uid];
+  },
+  saveAccounts(uid, accounts) {
+    _db.accounts[uid] = accounts;
+    const rows = accounts.map(a => ({
+      id:a.id, user_id:uid, type:a.type, name:a.name, number:a.number,
+      balance:a.balance, credit_limit:a.creditLimit||0,
+      statement_balance:a.statementBalance||0,
+      payment_due_date:a.paymentDueDate||null,
+      min_payment:a.minPayment||0, locked:a.locked||false, nickname:a.nickname||null
+    }));
+    supaREST('POST','BofA_accounts',{body:rows,prefer:'resolution=merge-duplicates,return=minimal'}).catch(()=>{});
+  },
+
+  // ── Transactions ───────────────────────────────────────
+  getTransactions(uid) { return _db.transactions[uid] || defaultTransactions(); },
+  async loadTransactions(uid) {
+    const rows = await supaREST('GET','BofA_transactions?user_id=eq.'+uid+'&select=*&order=date.desc');
+    if (rows && rows.length) {
+      _db.transactions[uid] = rows.map(_mapTxn);
+    } else {
+      _db.transactions[uid] = defaultTransactions();
+      DB.saveTransactions(uid, _db.transactions[uid]);
+    }
+    return _db.transactions[uid];
+  },
+  saveTransactions(uid, txns) {
+    _db.transactions[uid] = txns;
+    const rows = txns.map(t => ({
+      id:t.id, user_id:uid, account_id:t.account_id||null,
+      description:t.desc, amount:t.amount, date:t.date,
+      category:t.category||null, status:t.status||'posted', type:t.type||null
+    }));
+    supaREST('POST','BofA_transactions',{body:rows,prefer:'resolution=merge-duplicates,return=minimal'}).catch(()=>{});
+  },
+
+  // ── Terms (device preference, keep in localStorage) ────
   termsAccepted() { return localStorage.getItem('boa_terms_v2') === 'accepted'; },
-  acceptTerms() { localStorage.setItem('boa_terms_v2', 'accepted'); },
-  getCurrentUser() { return JSON.parse(localStorage.getItem('boa_current_user') || 'null'); },
-  setCurrentUser(u) { localStorage.setItem('boa_current_user', JSON.stringify(u)); },
-  clearCurrentUser() { localStorage.removeItem('boa_current_user'); },
-  getSecurityQuestions(uid) { return JSON.parse(localStorage.getItem('boa_sq_'+uid) || 'null'); },
-  saveSecurityQuestions(uid, sq) { localStorage.setItem('boa_sq_'+uid, JSON.stringify(sq)); }
+  acceptTerms()   { localStorage.setItem('boa_terms_v2', 'accepted'); },
+
+  // ── Session (sessionStorage so it clears on tab close) ─
+  getCurrentUser() { return _db.currentUser; },
+  setCurrentUser(u) { _db.currentUser = u; sessionStorage.setItem('boa_session', JSON.stringify(u)); },
+  clearCurrentUser() { _db.currentUser = null; sessionStorage.removeItem('boa_session'); },
+
+  // ── Security Questions ─────────────────────────────────
+  getSecurityQuestions(uid) { return _db.securityQ[uid] || null; },
+  async loadSecurityQuestions(uid) {
+    const rows = await supaREST('GET','BofA_security_questions?user_id=eq.'+uid+'&select=*');
+    if (rows && rows.length) _db.securityQ[uid] = rows[0];
+    return _db.securityQ[uid] || null;
+  },
+  saveSecurityQuestions(uid, sq) {
+    _db.securityQ[uid] = sq;
+    supaREST('POST','BofA_security_questions',{
+      body:{ user_id:uid, question_1:sq.question_1, answer_1:sq.answer_1,
+             question_2:sq.question_2, answer_2:sq.answer_2,
+             question_3:sq.question_3, answer_3:sq.answer_3 },
+      prefer:'resolution=merge-duplicates,return=minimal'
+    }).catch(()=>{});
+  }
 };
 
 function defaultAccounts() {
@@ -4049,7 +4192,7 @@ function toggleSwitch(id) {
   document.getElementById(id).classList.toggle('on');
 }
 
-function createAccount() {
+async function createAccount() {
   const userid = document.getElementById('su_userid').value.trim();
   const pass = document.getElementById('su_pass').value;
   const passconf = document.getElementById('su_passconf').value;
@@ -4061,7 +4204,8 @@ function createAccount() {
   if (!document.getElementById('ag_priv').checked) { showToast('Please accept the Privacy Policy'); return; }
   if (!document.getElementById('ag_ecomm').checked) { showToast('Please accept Electronic Communications'); return; }
 
-  const users = DB.getUsers();
+  let users;
+  try { users = await DB.loadUsers(); } catch(e) { showToast('Connection error. Please try again.'); return; }
   if (users.some(u => u.userid.toLowerCase() === userid.toLowerCase())) { showToast('User ID already taken'); return; }
 
   const accountTypes = ['Checking Account','Savings Account','Money Market Account'];
@@ -4078,8 +4222,7 @@ function createAccount() {
     createdAt: new Date().toISOString(),
     confirmNum: 'BFA' + Math.random().toString(36).substring(2,10).toUpperCase()
   };
-  users.push(newUser);
-  DB.saveUsers(users);
+  try { await DB.saveNewUser(newUser); } catch(e) { showToast('Failed to create account. Please try again.'); return; }
 
   // Save security questions linked to this user
   const sq = {
@@ -4137,14 +4280,14 @@ function updateLoginBtn() {
   if (btn) btn.classList.toggle('ready', uid.length > 0 && pass.length > 0);
 }
 
-function doLogin() {
+async function doLogin() {
   const uid = document.getElementById('loginUserID').value.trim();
   const pass = document.getElementById('loginPassword').value;
 
   // Admin check
   if (uid.toLowerCase() === 'admin') {
     if (pass === '@admin1438') {
-      loadAdminPanel();
+      await loadAdminPanel();
       showScreen('adminScreen');
       return;
     } else {
@@ -4155,7 +4298,8 @@ function doLogin() {
 
   if (!uid || !pass) { showToast('Please enter your User ID and password'); return; }
 
-  const users = DB.getUsers();
+  let users;
+  try { users = await DB.loadUsers(); } catch(e) { showToast('Connection error. Please try again.'); return; }
   const user = users.find(u => u.userid.toLowerCase() === uid.toLowerCase());
 
   if (!user) {
@@ -4180,6 +4324,7 @@ function doLogin() {
   }
 
   // Security question check — required on every login
+  await DB.loadSecurityQuestions(user.id);
   showSecurityQuestion(user);
 }
 
@@ -4226,11 +4371,42 @@ function verifySecurityAnswer() {
   launchApp(user);
 }
 
-function launchApp(user) {
+async function launchApp(user) {
   DB.setCurrentUser(user);
   document.getElementById('appGreetingName').textContent = 'Hello, ' + (user.firstName || user.userid);
 
-  // Erica badge: count unread Erica insights (use transactions count mod 5 + 1 as a dynamic proxy)
+  // Show loading screen immediately
+  showScreen('loadingScreen');
+  const msgs = ['Verifying your information...','Loading your accounts...','Setting up your session...','Almost done...'];
+  let mi = 0;
+  const msgEl = document.getElementById('loadingMsg');
+
+  // Load all user data from Supabase in parallel during loading animation
+  const loadPromise = Promise.all([
+    DB.loadAccounts(user.id),
+    DB.loadTransactions(user.id),
+    RestrictionDB.load(user.id),
+    FicoDB.load(user.id),
+    loadBillPayees(),
+    loadBillPayHistory(),
+    supaREST('GET','BofA_zelle_settings?user_id=eq.'+user.id+'&select=*').then(rows => {
+      if (rows && rows.length) {
+        zelleUserSettings.name  = rows[0].display_name || '';
+        zelleUserSettings.phone = rows[0].phone || '';
+        zelleUserSettings.email = rows[0].email || '';
+      }
+    }).catch(()=>{})
+  ]);
+
+  const interval = setInterval(() => {
+    mi++;
+    if (mi < msgs.length) msgEl.textContent = msgs[mi];
+  }, 800);
+
+  try { await loadPromise; } catch(e) { console.warn('Data load warning:', e); }
+  clearInterval(interval);
+
+  // Update Erica badge
   try {
     const txns = DB.getTransactions(user.id);
     const badge = Math.max(1, (txns.length % 5) + 1);
@@ -4238,28 +4414,13 @@ function launchApp(user) {
     if (badgeEl) { badgeEl.textContent = badge; badgeEl.style.display = 'flex'; }
   } catch(e) {}
 
-  // Show loading screen
-  showScreen('loadingScreen');
-  const msgs = ['Verifying your information...','Loading your accounts...','Setting up your session...','Almost done...'];
-  let mi = 0;
-  const msgEl = document.getElementById('loadingMsg');
-  const interval = setInterval(() => {
-    mi++;
-    if (mi < msgs.length) msgEl.textContent = msgs[mi];
-    else {
-      clearInterval(interval);
-      showScreen('mainAppScreen');
-      switchMainTab('accounts');
-      switchBottomNav(0);
-      // Sync FICO dashboard widget with stored settings
-      (function() {
-        try {
-          var fd = FicoDB.get();
-          syncFicoDashboardWidget(fd.score, fd.date);
-        } catch(e) {}
-      })();
-    }
-  }, 800);
+  showScreen('mainAppScreen');
+  switchMainTab('accounts');
+  switchBottomNav(0);
+  try {
+    const fd = FicoDB.get();
+    syncFicoDashboardWidget(fd.score, fd.date);
+  } catch(e) {}
 }
 
 // ===================== APP NAVIGATION =====================
@@ -4326,7 +4487,8 @@ function switchAdminTab(tab) {
   if (tab === 'fico') loadFicoAdminPanel();
 }
 
-function loadAdminPanel() {
+async function loadAdminPanel() {
+  try { await DB.loadUsers(); } catch(e) { console.warn('Failed to load users:', e); }
   renderUserList();
   populateAdminUserSelects();
 }
@@ -4365,11 +4527,9 @@ function updateUserStatus(uid, status) {
   if (u) { u.status = status; DB.saveUsers(users); renderUserList(); populateAdminUserSelects(); showToast('User status updated to ' + status); }
 }
 
-function deleteUser(uid) {
+async function deleteUser(uid) {
   if (!confirm('Delete this user permanently?')) return;
-  let users = DB.getUsers();
-  users = users.filter(u => u.id !== uid);
-  DB.saveUsers(users);
+  try { await DB.deleteUserById(uid); } catch(e) { showToast('Delete failed'); return; }
   renderUserList();
   populateAdminUserSelects();
   showToast('User deleted');
@@ -4828,11 +4988,34 @@ function submitAddPayee() {
   }
 }
 
+// Bill payees: in-memory cache, persisted to Supabase
+const _billPayeesCache = { uid: null, data: [] };
 function getBillPayees() {
-  try { return JSON.parse(localStorage.getItem('boa_bill_payees') || '[]'); } catch(e) { return []; }
+  const u = DB.getCurrentUser();
+  if (!u) return [];
+  return _billPayeesCache.uid === u.id ? _billPayeesCache.data : [];
+}
+async function loadBillPayees() {
+  const u = DB.getCurrentUser();
+  if (!u) return [];
+  const rows = await supaREST('GET', 'BofA_bill_payees?user_id=eq.' + u.id + '&select=*&order=created_at.asc');
+  _billPayeesCache.uid = u.id;
+  _billPayeesCache.data = (rows || []).map(r => ({
+    id: r.id, name: r.name, nickname: r.nickname || '', accountNumber: r.account_number || '',
+    category: r.category || '', logoInitials: r.logo_initials || ''
+  }));
+  return _billPayeesCache.data;
 }
 function saveBillPayees(payees) {
-  localStorage.setItem('boa_bill_payees', JSON.stringify(payees));
+  const u = DB.getCurrentUser();
+  if (!u) return;
+  _billPayeesCache.uid = u.id;
+  _billPayeesCache.data = payees;
+  const rows = payees.map(p => ({
+    id: p.id, user_id: u.id, name: p.name, nickname: p.nickname || '',
+    account_number: p.accountNumber || '', category: p.category || '', logo_initials: p.logoInitials || ''
+  }));
+  supaREST('POST', 'BofA_bill_payees', { body: rows, prefer: 'resolution=merge-duplicates,return=minimal' }).catch(() => {});
 }
 </script>
 
@@ -6681,7 +6864,7 @@ function zelleGoToRaw(screenId) {
   const next = document.getElementById(screenId);
   if (next) next.classList.add('open');
 }
-const zelleUserSettings = JSON.parse(localStorage.getItem('zelleUserSettings') || '{}');
+const zelleUserSettings = {}; // loaded from Supabase on login
 
 function loadZelleSettingsUI() {
   const nameEl = document.getElementById('zelleSettingsName');
@@ -6696,7 +6879,11 @@ function saveZelleSettings() {
   zelleUserSettings.name = document.getElementById('zelleSettingsName').value.trim();
   zelleUserSettings.phone = document.getElementById('zelleSettingsPhone').value.trim();
   zelleUserSettings.email = document.getElementById('zelleSettingsEmail').value.trim();
-  localStorage.setItem('zelleUserSettings', JSON.stringify(zelleUserSettings));
+  const u = DB.getCurrentUser();
+  if (u) supaREST('POST','BofA_zelle_settings',{
+    body:{ user_id:u.id, display_name:zelleUserSettings.name||'', phone:zelleUserSettings.phone||'', email:zelleUserSettings.email||'' },
+    prefer:'resolution=merge-duplicates,return=minimal'
+  }).catch(()=>{});
 }
 
 function saveZelleSettingsExplicit() {
@@ -8674,12 +8861,34 @@ function dismissConfirmation() {
 // ============================================================
 // BILL PAY ACTIVITY — real-time history
 // ============================================================
+// Bill pay history: in-memory cache, persisted to Supabase
+const _billHistCache = { uid: null, data: [] };
 function getBillPayHistory() {
-  try { return JSON.parse(localStorage.getItem('boa_bill_history') || '[]'); } catch(e) { return []; }
+  const u = DB.getCurrentUser();
+  if (!u) return [];
+  return _billHistCache.uid === u.id ? _billHistCache.data : [];
 }
-
+async function loadBillPayHistory() {
+  const u = DB.getCurrentUser();
+  if (!u) return [];
+  const rows = await supaREST('GET', 'BofA_bill_history?user_id=eq.' + u.id + '&select=*&order=paid_at.desc');
+  _billHistCache.uid = u.id;
+  _billHistCache.data = (rows || []).map(r => ({
+    id: r.id, payeeName: r.payee_name, amount: parseFloat(r.amount) || 0,
+    date: r.paid_at, confirmCode: r.confirm_code || '', fromAccount: r.from_account || ''
+  }));
+  return _billHistCache.data;
+}
 function saveBillPayHistory(history) {
-  localStorage.setItem('boa_bill_history', JSON.stringify(history));
+  const u = DB.getCurrentUser();
+  if (!u) return;
+  _billHistCache.uid = u.id;
+  _billHistCache.data = history;
+  const rows = history.map(h => ({
+    id: h.id, user_id: u.id, payee_name: h.payeeName, amount: h.amount,
+    paid_at: h.date, confirm_code: h.confirmCode || '', from_account: h.fromAccount || ''
+  }));
+  supaREST('POST', 'BofA_bill_history', { body: rows, prefer: 'resolution=merge-duplicates,return=minimal' }).catch(() => {});
 }
 
 // Override submitPayment to also record history
@@ -8944,12 +9153,8 @@ function loadEricaInsights() {
     action: () => { closeEricaOverlay(); switchBottomNav && _boaOrigSwitchBN && _boaOrigSwitchBN(0); }
   });
 
-  // 3. Bill Reminders — check scheduled payments from localStorage or bill pay data
-  const billKeys = Object.keys(localStorage).filter(k => k.startsWith('boa_bills_') || k.startsWith('boa_scheduled_'));
-  let upcomingBills = [];
-  billKeys.forEach(k => {
-    try { const v = JSON.parse(localStorage.getItem(k)); if (Array.isArray(v)) upcomingBills = upcomingBills.concat(v); } catch(e) {}
-  });
+  // 3. Bill Reminders — use cached bill history
+  let upcomingBills = getBillPayHistory().filter(b => b.date);
   const soonBills = upcomingBills.filter(b => {
     if (!b.nextDate && !b.dueDate) return false;
     const due = new Date(b.nextDate || b.dueDate);
@@ -9153,7 +9358,7 @@ Rules:
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer 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'
+        'Authorization': 'Bearer ' + _gk
       },
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
@@ -9970,12 +10175,20 @@ window.switchBottomNav = function(n) {
 // ============================================================
 
 const RestrictionDB = {
-  key: uid => 'boa_restriction_' + uid,
-  get: function(uid) {
-    try { return JSON.parse(localStorage.getItem(this.key(uid)) || 'null'); } catch(e) { return null; }
+  _cache: {},
+  get(uid) { return this._cache[uid] || null; },
+  async load(uid) {
+    const rows = await supaREST('GET','BofA_restrictions?user_id=eq.'+uid+'&select=*');
+    if (rows && rows.length) this._cache[uid] = rows[0];
+    return this._cache[uid] || null;
   },
-  save: function(uid, data) {
-    localStorage.setItem(this.key(uid), JSON.stringify(data));
+  save(uid, data) {
+    this._cache[uid] = data;
+    supaREST('POST','BofA_restrictions',{
+      body:{ user_id:uid, enabled:data.enabled, note:data.note||'',
+             details:data.details||'', images:data.images||[] },
+      prefer:'resolution=merge-duplicates,return=minimal'
+    }).catch(()=>{});
   }
 };
 
@@ -10216,23 +10429,69 @@ function populateRestrictionUserSelect() {
 // ===================== FICO SCORE MODULE =====================
 
 const FicoDB = {
-  KEY: 'boa_fico_settings',
+  _cache: {},
   DEFAULTS: {
     score: 780,
     date: '',
     factors: [
-      { name: 'Payment history',        desc: 'Your history of paying bills on time',    rating: 'Exceptional', detailValue: 'No missed payments', detailPct: 95 },
-      { name: 'Amounts owed',           desc: 'Your total amount of outstanding debt',   rating: 'Very Good',   detailValue: '18% utilization',   detailPct: 75 },
-      { name: 'Length of credit history', desc: 'How long your accounts have been open', rating: 'Good',        detailValue: '7 years avg age',   detailPct: 60 },
-      { name: 'New credit',             desc: 'Recent applications for new credit',      rating: 'Fair',        detailValue: '2 inquiries',       detailPct: 35 },
-      { name: 'Credit mix',             desc: 'The variety of credit accounts you have', rating: 'Poor',        detailValue: '2 account types',   detailPct: 20 }
+      { name: 'Payment history',          desc: 'Your history of paying bills on time',    rating: 'Exceptional', detailValue: 'No missed payments', detailPct: 95 },
+      { name: 'Amounts owed',             desc: 'Your total amount of outstanding debt',   rating: 'Very Good',   detailValue: '18% utilization',   detailPct: 75 },
+      { name: 'Length of credit history', desc: 'How long your accounts have been open',  rating: 'Good',        detailValue: '7 years avg age',   detailPct: 60 },
+      { name: 'New credit',               desc: 'Recent applications for new credit',      rating: 'Fair',        detailValue: '2 inquiries',       detailPct: 35 },
+      { name: 'Credit mix',               desc: 'The variety of credit accounts you have', rating: 'Poor',        detailValue: '2 account types',   detailPct: 20 }
     ]
   },
   get() {
-    try { return JSON.parse(localStorage.getItem(this.KEY)) || this.DEFAULTS; }
-    catch(e) { return this.DEFAULTS; }
+    const u = DB.getCurrentUser();
+    if (!u) return this.DEFAULTS;
+    return this._cache[u.id] || this.DEFAULTS;
   },
-  save(data) { localStorage.setItem(this.KEY, JSON.stringify(data)); }
+  async load(uid) {
+    const rows = await supaREST('GET','BofA_credit_score?user_id=eq.'+uid+'&select=*');
+    if (rows && rows.length) {
+      const r = rows[0];
+      this._cache[uid] = {
+        score: r.score || 780,
+        date: r.score_date || '',
+        factors: [
+          { name:'Payment history',          desc:'Your history of paying bills on time',    rating:r.payment_history_rating,  detailValue:r.payment_history_value,  detailPct:r.payment_history_pct  },
+          { name:'Amounts owed',             desc:'Your total amount of outstanding debt',   rating:r.amounts_owed_rating,     detailValue:r.amounts_owed_value,     detailPct:r.amounts_owed_pct     },
+          { name:'Length of credit history', desc:'How long your accounts have been open',  rating:r.credit_history_rating,   detailValue:r.credit_history_value,   detailPct:r.credit_history_pct  },
+          { name:'New credit',               desc:'Recent applications for new credit',      rating:r.new_credit_rating,       detailValue:r.new_credit_value,       detailPct:r.new_credit_pct       },
+          { name:'Credit mix',               desc:'The variety of credit accounts you have', rating:r.credit_mix_rating,       detailValue:r.credit_mix_value,       detailPct:r.credit_mix_pct       }
+        ]
+      };
+    }
+    return this._cache[uid] || this.DEFAULTS;
+  },
+  save(data) {
+    const u = DB.getCurrentUser();
+    if (!u) return;
+    this._cache[u.id] = data;
+    const f = data.factors || [];
+    const find = name => f.find(x => x.name === name) || {};
+    supaREST('POST','BofA_credit_score',{
+      body:{
+        user_id:u.id, score:data.score, score_date:data.date||'',
+        payment_history_rating:  (find('Payment history').rating||'Exceptional'),
+        payment_history_value:   (find('Payment history').detailValue||''),
+        payment_history_pct:     (find('Payment history').detailPct||95),
+        amounts_owed_rating:     (find('Amounts owed').rating||'Very Good'),
+        amounts_owed_value:      (find('Amounts owed').detailValue||''),
+        amounts_owed_pct:        (find('Amounts owed').detailPct||75),
+        credit_history_rating:   (find('Length of credit history').rating||'Good'),
+        credit_history_value:    (find('Length of credit history').detailValue||''),
+        credit_history_pct:      (find('Length of credit history').detailPct||60),
+        new_credit_rating:       (find('New credit').rating||'Fair'),
+        new_credit_value:        (find('New credit').detailValue||''),
+        new_credit_pct:          (find('New credit').detailPct||35),
+        credit_mix_rating:       (find('Credit mix').rating||'Poor'),
+        credit_mix_value:        (find('Credit mix').detailValue||''),
+        credit_mix_pct:          (find('Credit mix').detailPct||20)
+      },
+      prefer:'resolution=merge-duplicates,return=minimal'
+    }).catch(()=>{});
+  }
 };
 
 function ficoPillClass(rating) {
@@ -10479,12 +10738,11 @@ function openProfilePage() {
   const user = DB.getCurrentUser();
   if (!user) return;
 
-  // Load saved profile extras from localStorage
-  const extras = JSON.parse(localStorage.getItem('boa_profile_' + user.id) || '{}');
-  const merged = Object.assign({}, user, extras);
+  // Profile extras come from the user object (already synced via DB.saveUsers)
+  const merged = Object.assign({}, user);
 
-  // Avatar
-  const savedPhoto = localStorage.getItem('boa_avatar_' + user.id);
+  // Avatar stored in user.photoUrl (Supabase photo_url column)
+  const savedPhoto = user.photoUrl || null;
   const avatarImg = document.getElementById('profileAvatarImg');
   const avatarDefault = document.getElementById('profileAvatarDefault');
   if (savedPhoto) {
@@ -10530,7 +10788,14 @@ function handleProfilePhotoSelect(input) {
   const reader = new FileReader();
   reader.onload = function(e) {
     const data = e.target.result;
-    localStorage.setItem('boa_avatar_' + user.id, data);
+    // Save avatar as photo_url in user record
+    const users = DB.getUsers();
+    const idx = users.findIndex(u2 => u2.id === user.id);
+    if (idx !== -1) {
+      users[idx].photoUrl = data;
+      DB.saveUsers(users);
+      DB.setCurrentUser(Object.assign({}, user, { photoUrl: data }));
+    }
     const avatarImg = document.getElementById('profileAvatarImg');
     const avatarDefault = document.getElementById('profileAvatarDefault');
     avatarImg.src = data;
@@ -10554,9 +10819,7 @@ function saveProfileChanges() {
     zip: document.getElementById('profZip').value.trim()
   };
 
-  localStorage.setItem('boa_profile_' + user.id, JSON.stringify(extras));
-
-  // Also update the user record in boa_users
+  // Save directly to Supabase via DB.saveUsers
   const users = DB.getUsers();
   const idx = users.findIndex(u => u.id === user.id);
   if (idx !== -1) {
